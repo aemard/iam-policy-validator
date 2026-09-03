@@ -152,6 +152,15 @@ MEDIUM_SEVERITY_LEVELS = ("warning", "medium")
 # Low severity issues (informational)
 LOW_SEVERITY_LEVELS = ("info", "low")
 
+# statement_index used by a finding that belongs to the whole policy rather than one
+# statement. Formatters special-case it (report.py, formatters/enhanced.py) and the
+# suppressed-statement filter in policy_checks.py only ever holds real indices.
+POLICY_LEVEL_STATEMENT_INDEX = -1
+
+# issue_type of the finding the registry emits when a check raises. Shared so the
+# places that must not filter it out cannot drift from the place that emits it.
+CHECK_EXECUTION_ERROR = "check_execution_error"
+
 # Severity configuration with emoji and action guidance for PR comments
 SEVERITY_CONFIG = {
     "critical": {"emoji": "🔴", "action": "Block deployment"},

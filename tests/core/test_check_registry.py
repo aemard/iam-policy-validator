@@ -10,7 +10,7 @@ from iam_validator.core.check_registry import (
     PolicyCheck,
     create_default_registry,
 )
-from iam_validator.core.models import Statement, ValidationIssue
+from iam_validator.core.models import IAMPolicy, Statement, ValidationIssue
 
 
 class MockCheck(PolicyCheck):
@@ -135,6 +135,58 @@ class NoneSeverityCheck(PolicyCheck):
                 message="This should be visible",
             ),
         ]
+
+
+class FullWildcardStandIn(PolicyCheck):
+    """Stands in for the full_wildcard check, which supersedes other findings."""
+
+    @property
+    def check_id(self) -> str:
+        return "full_wildcard"
+
+    @property
+    def description(self) -> str:
+        return "Supersedes other findings on a */* statement"
+
+    async def execute(self, statement, statement_idx, fetcher, config):
+        return [
+            ValidationIssue(
+                severity="critical",
+                statement_index=statement_idx,
+                issue_type="full_wildcard",
+                message="Allows all actions on all resources",
+            )
+        ]
+
+
+class FailingPolicyLevelCheck(PolicyCheck):
+    """Policy-level check that raises."""
+
+    @property
+    def check_id(self) -> str:
+        return "failing_policy_check"
+
+    @property
+    def description(self) -> str:
+        return "A policy-level check that fails"
+
+    async def execute_policy(self, policy, policy_file, fetcher, config, **kwargs):
+        raise ValueError("Intentional policy-level failure for testing")
+
+
+class ReturnsNone(PolicyCheck):
+    """Check that returns None instead of a list - a plausible custom-check bug."""
+
+    @property
+    def check_id(self) -> str:
+        return "returns_none"
+
+    @property
+    def description(self) -> str:
+        return "Returns None instead of a list"
+
+    async def execute(self, statement, statement_idx, fetcher, config):
+        return None  # type: ignore[return-value]
 
 
 class TestCheckConfig:
@@ -765,17 +817,72 @@ class TestOnCheckError:
 
         assert {issue.issue_type for issue in issues} == {"check_execution_error", "test_issue"}
 
-    async def test_failure_is_not_silenced_by_the_failing_checks_own_config(self, mock_statement, mock_fetcher):
-        # A check whose own config hides every severity must not thereby hide the
-        # notice that it crashed - the finding is about the check, not from it.
+    @pytest.mark.parametrize(
+        "config_kwargs",
+        [
+            {"hide_severities": frozenset({"error"})},
+            {"ignore_patterns": [{"filepath": ".*"}]},
+        ],
+        ids=["hide_severities", "ignore_patterns"],
+    )
+    async def test_failure_is_not_silenced_by_the_failing_checks_own_config(
+        self, mock_statement, mock_fetcher, config_kwargs
+    ):
+        # The finding is about the check, not from it, so it must bypass _process_issues.
+        # These two configs are the meaningful cases because they DO filter a normal
+        # finding from this check; an issue severity of "none" never reaches the config,
+        # so asserting on that would pin nothing.
         registry = CheckRegistry(on_check_error="fail")
         registry.register(FailingCheck())
-        registry.configure_check(
-            "failing_check",
-            CheckConfig(check_id="failing_check", enabled=True, severity="none"),
-        )
+        registry.configure_check("failing_check", CheckConfig(check_id="failing_check", enabled=True, **config_kwargs))
 
-        issues = await registry.execute_checks_sequential(mock_statement, 0, mock_fetcher)
+        issues = await registry.execute_checks_sequential(mock_statement, 0, mock_fetcher, "policy.json")
 
         assert len(issues) == 1
         assert issues[0].issue_type == "check_execution_error"
+
+    async def test_supersedes_does_not_suppress_the_failure(self, mock_fetcher):
+        # suppress_superseded_findings defaults to True in the shipped config, and a
+        # superseding finding cannot stand in for a check that produced none at all.
+        registry = CheckRegistry(suppress_superseded=True, on_check_error="fail")
+        registry.register(FailingCheck())
+        registry.register(FullWildcardStandIn())
+        registry.configure_check("failing_check", CheckConfig(check_id="failing_check", enabled=True))
+        registry.configure_check("full_wildcard", CheckConfig(check_id="full_wildcard", enabled=True))
+
+        issues = await registry.execute_checks_parallel(
+            Statement(Effect="Allow", Action="*", Resource="*"), 0, mock_fetcher
+        )
+
+        assert "check_execution_error" in {issue.issue_type for issue in issues}
+
+    async def test_policy_level_failure_uses_the_policy_level_index(self, mock_fetcher):
+        # -1 is this repo's statement_index for a whole-policy finding (policy_size.py,
+        # policy_structure.py) and formatters special-case it. 0 renders as "Statement 1"
+        # and is dropped by the suppressed-statement filter in policy_checks.py.
+        registry = CheckRegistry(on_check_error="fail")
+        registry.register(FailingPolicyLevelCheck())
+        registry.configure_check("failing_policy_check", CheckConfig(check_id="failing_policy_check", enabled=True))
+        policy = IAMPolicy(
+            Version="2012-10-17",
+            Statement=[Statement(Effect="Allow", Action="s3:GetObject", Resource="*")],
+        )
+
+        issues = await registry.execute_policy_checks(policy, "policy.json", mock_fetcher)
+
+        assert len(issues) == 1
+        assert issues[0].issue_type == "check_execution_error"
+        assert issues[0].statement_index == -1
+
+    async def test_a_check_returning_a_non_list_is_reported(self, mock_statement, mock_fetcher):
+        # A check that returns None produced no findings either - the same silent
+        # unsoundness as one that raised.
+        registry = CheckRegistry(on_check_error="fail")
+        registry.register(ReturnsNone())
+        registry.register(IssueGeneratingCheck(num_issues=1))
+        registry.configure_check("returns_none", CheckConfig(check_id="returns_none", enabled=True))
+        registry.configure_check("issue_check", CheckConfig(check_id="issue_check", enabled=True))
+
+        issues = await registry.execute_checks_parallel(mock_statement, 0, mock_fetcher)
+
+        assert {issue.issue_type for issue in issues} == {"check_execution_error", "test_issue"}

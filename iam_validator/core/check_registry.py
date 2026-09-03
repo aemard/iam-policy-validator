@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from iam_validator.core.aws_service import AWSServiceFetcher
 from iam_validator.core.config.check_documentation import CheckDocumentationRegistry
+from iam_validator.core.constants import CHECK_EXECUTION_ERROR, POLICY_LEVEL_STATEMENT_INDEX
 from iam_validator.core.ignore_patterns import IgnorePatternMatcher
 from iam_validator.core.models import Statement, ValidationIssue
 
@@ -400,7 +401,8 @@ class CheckRegistry:
         Args:
             check_id: The check that raised
             error: The exception it raised
-            statement_idx: Statement index for reporting (0 for policy-level checks)
+            statement_idx: Statement index for reporting; POLICY_LEVEL_STATEMENT_INDEX
+                for policy-level checks, which have no single statement
 
         Returns:
             A single-issue list, or an empty list when on_check_error is "warn"
@@ -414,7 +416,7 @@ class CheckRegistry:
             ValidationIssue(
                 severity="error",
                 statement_index=statement_idx,
-                issue_type="check_execution_error",
+                issue_type=CHECK_EXECUTION_ERROR,
                 check_id=check_id,
                 message=(
                     f"Check `{check_id}` raised `{type(error).__name__}: {error}` and produced "
@@ -568,6 +570,14 @@ class CheckRegistry:
             return issues_map
         superseder_ids = {check.check_id for check, _ in superseding}
         suppressed_ids = set(issues_map.keys()) - superseder_ids
+        # A check that raised is never redundant: the superseding finding cannot stand in
+        # for a check that produced no findings at all, and suppressing the notice would
+        # report the statement as merely "suppressed" when it was in fact never validated.
+        suppressed_ids -= {
+            check_id
+            for check_id, issues in issues_map.items()
+            if any(issue.issue_type == CHECK_EXECUTION_ERROR for issue in issues)
+        }
         if not suppressed_ids:
             return issues_map
         for _, s_issues in superseding:
@@ -646,6 +656,12 @@ class CheckRegistry:
             elif isinstance(result, list):
                 processed = self._process_issues(result, task_checks[idx], configs[idx], filepath)
                 issues_map[task_checks[idx].check_id] = processed
+            else:
+                issues_map[task_checks[idx].check_id] = self._handle_check_error(
+                    task_checks[idx].check_id,
+                    TypeError(f"check returned {type(result).__name__}, expected a list of findings"),
+                    statement_idx,
+                )
 
         if self.suppress_superseded:
             issues_map = self._apply_supersedes(statement, enabled_checks, issues_map)
@@ -739,7 +755,7 @@ class CheckRegistry:
                         )
                         all_issues.extend(self._process_issues(issues, check, config, policy_file))
                     except Exception as e:  # pylint: disable=broad-exception-caught
-                        all_issues.extend(self._handle_check_error(check.check_id, e, 0))
+                        all_issues.extend(self._handle_check_error(check.check_id, e, POLICY_LEVEL_STATEMENT_INDEX))
             return all_issues
 
         # Execute all policy-level checks in parallel
@@ -760,11 +776,19 @@ class CheckRegistry:
             if isinstance(result, Exception):
                 # Report the failure but continue with other checks
                 check = policy_level_checks[idx]
-                all_issues.extend(self._handle_check_error(check.check_id, result, 0))
+                all_issues.extend(self._handle_check_error(check.check_id, result, POLICY_LEVEL_STATEMENT_INDEX))
             elif isinstance(result, list):
                 check = policy_level_checks[idx]
                 config = configs[idx]
                 all_issues.extend(self._process_issues(result, check, config, policy_file))
+            else:
+                all_issues.extend(
+                    self._handle_check_error(
+                        policy_level_checks[idx].check_id,
+                        TypeError(f"check returned {type(result).__name__}, expected a list of findings"),
+                        POLICY_LEVEL_STATEMENT_INDEX,
+                    )
+                )
 
         return all_issues
 

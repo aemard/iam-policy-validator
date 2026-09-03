@@ -177,9 +177,10 @@ settings:
 missing. This was the behaviour before the setting existed.
 
 !!! note "Custom checks"
-A bug in a custom check now fails the run instead of degrading quietly. If you load
-third-party checks you do not control and would rather not gate on their stability,
-set `on_check_error: warn` and watch the logs.
+
+    A bug in a custom check now fails the run instead of degrading quietly. If you load
+    third-party checks you do not control and would rather not gate on their stability,
+    set `on_check_error: warn` and watch the logs.
 
 ## Check Configuration
 

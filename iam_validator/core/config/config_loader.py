@@ -168,6 +168,7 @@ class SettingsSchema(BaseModel):
     hide_severities: list[str] | None = None  # Global severity filtering
     off_diff_comment_mode: str = "summary_only"
     comment_tag: str | None = None
+    on_check_error: str = "fail"
 
     @field_validator("off_diff_comment_mode")
     @classmethod
@@ -175,6 +176,14 @@ class SettingsSchema(BaseModel):
         valid_modes = {"summary_only", "individual", "modified_statements_only"}
         if v not in valid_modes:
             raise ValueError(f"Invalid off_diff_comment_mode: {v}. Must be one of: {sorted(valid_modes)}")
+        return v
+
+    @field_validator("on_check_error")
+    @classmethod
+    def validate_on_check_error(cls, v: str) -> str:
+        valid_modes = {"fail", "warn"}
+        if v not in valid_modes:
+            raise ValueError(f"Invalid on_check_error: {v}. Must be one of: {sorted(valid_modes)}")
         return v
 
     @field_validator("comment_tag")

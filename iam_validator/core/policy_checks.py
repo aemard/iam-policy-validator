@@ -15,6 +15,7 @@ from iam_validator.core import constants
 from iam_validator.core.aws_service import AWSServiceFetcher
 from iam_validator.core.check_registry import CheckRegistry, create_default_registry
 from iam_validator.core.config.config_loader import ConfigLoader, ValidatorConfig
+from iam_validator.core.constants import CHECK_EXECUTION_ERROR
 from iam_validator.core.models import (
     IAMPolicy,
     PolicyType,
@@ -353,7 +354,15 @@ async def _validate_policy_with_registry(
         issues = await registry.execute_checks_parallel(statement, idx, fetcher, policy_file)
 
         if skipped_check_ids:
-            issues = [issue for issue in issues if issue.check_id not in skipped_check_ids]
+            # A check that raised is exempt: check_execution_error carries the failing
+            # check's check_id, and dropping it here would let a crash in one of these
+            # checks report the policy clean, which is the outcome the finding exists
+            # to prevent.
+            issues = [
+                issue
+                for issue in issues
+                if issue.issue_type == CHECK_EXECUTION_ERROR or issue.check_id not in skipped_check_ids
+            ]
 
         # Add issues to result
         result.issues.extend(issues)  # pylint: disable=no-member
