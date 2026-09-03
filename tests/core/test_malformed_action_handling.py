@@ -9,15 +9,36 @@ of the fetcher, which the check registry downgraded to a log warning -- so
 for the whole statement and the policy passed.
 """
 
+from pathlib import Path
+from unittest.mock import AsyncMock
+
 import pytest
 
 from iam_validator.checks.action_validation import ActionValidationCheck
 from iam_validator.core.aws_service import AWSServiceFetcher
 from iam_validator.core.aws_service.parsers import ServiceParser
+from iam_validator.core.aws_service.storage import ServiceFileStorage
 from iam_validator.core.check_registry import CheckConfig
 from iam_validator.core.models import Statement
 
 MALFORMED_ACTIONS = ["*:Untag*", "*:UntagResource", "*:*", "s3GetObject", "s3:Get Object"]
+
+# The guard under test lives in AWSServiceFetcher itself, so these tests need the real
+# object rather than the mock_fetcher fixture. Only the service lookup is redirected, at
+# the in-repo definitions for s3 and iam, so nothing reaches the network.
+DEFINITIONS_DIR = Path(__file__).resolve().parents[2] / "examples" / "aws-service-definitions"
+
+
+@pytest.fixture
+def offline_fetcher():
+    storage = ServiceFileStorage(aws_services_dir=DEFINITIONS_DIR)
+    fetcher = AWSServiceFetcher()
+
+    async def load(service_name: str):
+        return storage.load_service_from_file(service_name)
+
+    fetcher.fetch_service_by_name = AsyncMock(side_effect=load)  # type: ignore[method-assign]
+    return fetcher
 
 
 class TestActionFormatErrorMessage:
@@ -68,37 +89,35 @@ class TestActionFormatErrorMessage:
 class TestFetcherReturnsInsteadOfRaising:
     """validate_action's documented contract is a tuple, for every input."""
 
-    @pytest.fixture
-    def fetcher(self):
-        return AWSServiceFetcher()
-
     @pytest.mark.parametrize("action", MALFORMED_ACTIONS)
-    async def test_validate_action_reports_malformed_action(self, fetcher, action):
-        is_valid, error, is_wildcard = await fetcher.validate_action(action)
+    async def test_validate_action_reports_malformed_action(self, offline_fetcher, action):
+        is_valid, error, is_wildcard = await offline_fetcher.validate_action(action)
 
         assert is_valid is False
         assert error is not None
         assert "Invalid action format" in error
         assert is_wildcard is False
 
-    async def test_validate_actions_batch_reports_malformed_action(self, fetcher):
-        results = await fetcher.validate_actions_batch(["*:Untag*", "s3:GetObject"])
+    async def test_validate_actions_batch_reports_malformed_action(self, offline_fetcher):
+        results = await offline_fetcher.validate_actions_batch(["*:Untag*", "s3:GetObject"])
 
         assert set(results) == {"*:Untag*", "s3:GetObject"}
         assert results["*:Untag*"][0] is False
         assert "Invalid action format" in results["*:Untag*"][1]
         assert results["s3:GetObject"][0] is True
 
-    async def test_validate_actions_batch_still_groups_by_service(self, fetcher):
-        results = await fetcher.validate_actions_batch(["s3:GetObject", "s3:PutObject", "iam:CreateRole", "*:Untag*"])
+    async def test_validate_actions_batch_still_groups_by_service(self, offline_fetcher):
+        results = await offline_fetcher.validate_actions_batch(
+            ["s3:GetObject", "s3:PutObject", "iam:CreateRole", "*:Untag*"]
+        )
 
         assert results["s3:GetObject"][0] is True
         assert results["s3:PutObject"][0] is True
         assert results["iam:CreateRole"][0] is True
         assert results["*:Untag*"][0] is False
 
-    async def test_condition_key_validation_is_skipped_not_crashed(self, fetcher):
-        result = await fetcher.validate_condition_key("*:Untag*", "aws:ResourceTag/env")
+    async def test_condition_key_validation_is_skipped_not_crashed(self, offline_fetcher):
+        result = await offline_fetcher.validate_condition_key("*:Untag*", "aws:ResourceTag/env")
 
         assert result.is_valid is True
 
@@ -119,7 +138,7 @@ class TestCheckReportsMalformedAction:
         assert issues[0].severity == "error"
         assert "service prefix cannot contain a wildcard" in issues[0].message
 
-    async def test_a_malformed_action_does_not_hide_its_neighbours(self):
+    async def test_a_malformed_action_does_not_hide_its_neighbours(self, offline_fetcher):
         statement = Statement(Effect="Allow", Action=["*:Untag*", "s3:NoSuchAction", "s3:GetObject"], Resource=["*"])
 
         async with AWSServiceFetcher() as fetcher:
